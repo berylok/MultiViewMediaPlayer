@@ -101,7 +101,8 @@ public:
 
 private:
     std::atomic<bool> m_muted{false};
-
+private:
+    QMutex m_audioMutex;   // 保护 m_audioOutput 的访问
 };
 
 #endif // DECODERTHREAD_H

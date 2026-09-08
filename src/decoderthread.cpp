@@ -96,17 +96,20 @@ double DecoderThread::getCurrentTime() const
     return m_currentTime;
 }
 
-void DecoderThread::setVolume(int volume)
-{
+void DecoderThread::setVolume(int volume) {
     int newVol = qBound(0, volume, 100);
     int oldVol = m_volume.loadRelaxed();
     if (oldVol != newVol) {
         m_volume.storeRelaxed(newVol);
-        qDebug() << "setVolume changed:" << oldVol << "->" << newVol;
         emit volumeChanged(newVol);
+
+        // 立即应用音量到音频输出
+        QMutexLocker locker(&m_audioMutex);  // 新增互斥量，保护 m_audioOutput
+        if (m_audioOutput) {
+            m_audioOutput->setVolume(newVol / 100.0f);
+        }
     }
 }
-
 // 动态启用音频
 // 修改 enableAudio() 函数
 void DecoderThread::enableAudio()
@@ -592,9 +595,6 @@ void DecoderThread::run()
 
                         QImage img(rgbFrame->data[0], videoCodecCtx->width, videoCodecCtx->height,
                                    rgbFrame->linesize[0], QImage::Format_RGB32);
-                        // if (img.bytesPerLine() != videoCodecCtx->width * 4) {
-                        //     img = img.copy();  // 复制为连续行数据，消除填充
-                        // }
                         emit frameReady(img);
                         // ✅ 在这里递增计数
                         m_decodedVideoFrames++;
