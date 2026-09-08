@@ -19,6 +19,11 @@
 #include <QSlider>
 #include <QAction>
 
+static const QString MEDIA_FILTER =
+    "视频文件 (*.mp4 *.avi *.mkv *.mov *.webm *.ts);;"
+    "图片文件 (*.jpg *.jpeg *.png *.bmp *.gif *.tiff *.tif);;"
+    "所有文件 (*.*)";
+
 MultiViewPlayer::MultiViewPlayer(QWidget *parent) : QMainWindow(parent)
 {
     setAcceptDrops(true);
@@ -340,14 +345,10 @@ void MultiViewPlayer::updateLayout()
 void MultiViewPlayer::addVideo()
 {
     QFileDialog dialog(this);
-    dialog.setWindowTitle("选择视频文件");
+    dialog.setWindowTitle("选择媒体文件");
     dialog.setFileMode(QFileDialog::ExistingFiles);
-
-    // 关键：使用系统原生对话框，Qt 不会去读注册表获取图标信息
     dialog.setOption(QFileDialog::DontUseNativeDialog, false);
-
-    // 设置过滤器（原生对话框也会读注册表，但速度更快）
-    dialog.setNameFilter("视频文件 (*.mp4 *.avi *.mkv *.mov *.webm *.ts)");
+    dialog.setNameFilter(MEDIA_FILTER);   // 替换原先的过滤器
 
     if (dialog.exec()) {
         QStringList files = dialog.selectedFiles();
@@ -416,7 +417,7 @@ void MultiViewPlayer::openEighteenVideos()
     dialog.setWindowTitle("选择源视频文件（将同步打开18个实例）");
     dialog.setFileMode(QFileDialog::ExistingFile);
     dialog.setOption(QFileDialog::DontUseNativeDialog, false);
-    dialog.setNameFilter("视频文件 (*.mp4 *.avi *.mkv *.mov *.webm *.ts)");
+    dialog.setNameFilter(MEDIA_FILTER);
 
     if (!dialog.exec()) {
         return;
