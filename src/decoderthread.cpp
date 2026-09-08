@@ -444,6 +444,7 @@ void DecoderThread::run()
 
         // 处理跳转
         // 在 run() 函数中，替换原有的 seek 处理部分
+        // 在 run() 主循环的 seek 处理部分
         if (m_seeking) {
             double target;
             {
@@ -455,50 +456,47 @@ void DecoderThread::run()
             qDebug() << "Seeking to position:" << target;
 
             int64_t seekTarget = static_cast<int64_t>(target * m_duration * AV_TIME_BASE);
+            if (avformat_seek_file(fmtCtx, -1, INT64_MIN, seekTarget, seekTarget, AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_FRAME) >= 0) {
+                if (videoCodecCtx) avcodec_flush_buffers(videoCodecCtx);
+                if (m_audioCodecCtx) avcodec_flush_buffers(m_audioCodecCtx);
 
-            // 使用更精确的 seek 标志
-            int seekFlags = AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_FRAME;
-
-            if (avformat_seek_file(fmtCtx, -1, INT64_MIN, seekTarget, seekTarget, seekFlags) >= 0) {
-                // 清空所有解码器缓冲区
-                if (videoCodecCtx) {
-                    avcodec_flush_buffers(videoCodecCtx);
+                // ---- 强制释放音频资源 ----
+                {
+                    QMutexLocker locker(&m_audioMutex);
+                    if (m_audioOutput) {
+                        m_audioOutput->stop();
+                        m_audioOutput->reset();
+                        delete m_audioOutput;
+                        m_audioOutput = nullptr;
+                        m_audioDevice = nullptr;
+                    }
                 }
-                if (m_audioCodecCtx) {
-                    avcodec_flush_buffers(m_audioCodecCtx);
+                // 关键：等待资源释放（实测 50ms 足够）
+                QThread::msleep(50);
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+
+                // 重新初始化音频（若启用）
+                if (m_audioEnabled.loadRelaxed() && m_swrCtx && m_audioCodecCtx) {
+                    QMutexLocker locker(&m_audioMutex);
+                    if (!initAudioOutput()) {
+                        qWarning() << "Failed to reinit audio after seek";
+                    }
                 }
 
-                // 重置音频输出
-                if (m_audioOutput) {
-                    m_audioOutput->stop();
-                    m_audioOutput->reset();  // 清空内部缓冲
-                    m_audioDevice = m_audioOutput->start();  // 重新启动并获取新的 QIODevice 指针
-                    // 恢复音量
-                    int currentVol = m_volume.loadRelaxed();
-                    m_audioOutput->setVolume(currentVol / 100.0f);
-                }
-
-                // 重置时间相关变量
+                // 重置时间
                 lastFrameTime = 0;
                 m_currentTime = target * m_duration;
+                audioClock = 0.0;
+                m_lastAudioWriteTime = 0;
 
-                // 重新计算音频时钟
-                // 注意：不能直接设置为 m_currentTime，需要从实际帧中获取
-                audioClock = 0.0;  // 重置时钟，让音频帧重新计算
-
-                // 显示 seek 后的位置
                 emit positionChanged(target);
                 emit timeChanged(m_currentTime, m_duration);
-
                 qDebug() << "Seek completed, new time:" << m_currentTime;
             } else {
                 qWarning() << "Seek failed for target:" << seekTarget;
             }
 
-            continue;  // 跳过后面的帧处理
-
-
-
+            continue;
         }
 
         // 暂停/恢复处理
