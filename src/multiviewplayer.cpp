@@ -42,9 +42,9 @@ MultiViewPlayer::MultiViewPlayer(QWidget *parent) : QMainWindow(parent)
         m_muteButton->setIcon(style()->standardIcon(QStyle::SP_MediaVolume));
     }
 
-    if (m_videoWidgets.isEmpty()) {
-        addVideoWidget();
-    }
+    // if (m_videoWidgets.isEmpty()) {
+    //     addVideoWidget();
+    // }
 }
 
 MultiViewPlayer::~MultiViewPlayer()
@@ -287,50 +287,55 @@ void MultiViewPlayer::updateLayout()
 {
     if (!m_grid || m_updatingLayout) return;
 
-    // 清空布局中的所有控件
+    // 清空布局项，但不删除控件
     while (QLayoutItem *item = m_grid->takeAt(0)) {
-        // 不要删除控件本身，只删除布局项
         delete item;
     }
 
-    int videoCount = m_videoWidgets.size();
-    if (videoCount == 0) {
-        qDebug() << "No videos to layout";
+    int count = m_videoWidgets.size();
+    if (count == 0) {
+        // 没有视频时清空布局，显示空白或提示
         return;
     }
 
-    int cols = MAX_COLS;
-    int rows = (videoCount + cols - 1) / cols;
+    // 每行最多 9 列
+    const int MAX_COLS_PER_ROW = 9;
+    int cols = qMin(count, MAX_COLS_PER_ROW);   // 列数 = 最多9，但不能超过视频总数
+    int rows = (count + cols - 1) / cols;       // 行数自动计算
 
-    qDebug() << "Updating layout:" << videoCount << "videos," << rows << "rows," << cols << "cols";
+    qDebug() << "Layout: count=" << count << "rows=" << rows << "cols=" << cols;
 
-    // 重新添加所有视频到布局
-    for (int i = 0; i < videoCount; ++i) {
+    // 重新添加所有视频到网格
+    for (int i = 0; i < count; ++i) {
         int row = i / cols;
         int col = i % cols;
-
-        if (row < MAX_ROWS && m_videoWidgets[i]) {
+        if (row < rows && m_videoWidgets[i]) {
             m_grid->addWidget(m_videoWidgets[i], row, col);
-            m_videoWidgets[i]->show(); // 确保控件可见
-            qDebug() << "Placed video" << i << "at row" << row << "col" << col;
+            m_videoWidgets[i]->show();
         }
     }
 
-    // 设置行列拉伸因子
-    for (int r = 0; r < MAX_ROWS; ++r) {
+    // 设置拉伸因子，让所有行列均匀填满窗口
+    for (int r = 0; r < rows; ++r) {
         m_grid->setRowStretch(r, 1);
     }
     for (int c = 0; c < cols; ++c) {
         m_grid->setColumnStretch(c, 1);
     }
 
+    // 多余的行/列拉伸设为0（避免占空间）
+    for (int r = rows; r < MAX_ROWS; ++r) {
+        m_grid->setRowStretch(r, 0);
+    }
+    for (int c = cols; c < MAX_COLS; ++c) {
+        m_grid->setColumnStretch(c, 0);
+    }
+
     m_grid->setSpacing(0);
     m_grid->setContentsMargins(0, 0, 0, 0);
-
-    // 强制更新
     m_central->update();
-    m_grid->update();
 }
+
 
 void MultiViewPlayer::addVideo()
 {
@@ -398,9 +403,6 @@ void MultiViewPlayer::addVideoWidget(const QString &filePath)
         });
     }
 
-    if (!m_activeVideo) {
-        m_activeVideo = vid;
-    }
 
     updateLayout();
 
