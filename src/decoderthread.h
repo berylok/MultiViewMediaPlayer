@@ -119,6 +119,7 @@ private:
     int m_actualOutWidth;              // 当前实际输出宽度
     int m_actualOutHeight;             // 当前实际输出高度
 
+
 };
 
 #endif // DECODERTHREAD_H

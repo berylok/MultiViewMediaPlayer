@@ -69,7 +69,15 @@ void DecoderThread::setFile(const QString &path)
 void DecoderThread::requestStop()
 {
     m_stop = true;
-    m_audioCond.wakeAll();
+    // 立即停止音频输出，解除可能的 write() 阻塞
+    {
+        QMutexLocker locker(&m_audioMutex);
+        if (m_audioOutput) {
+            m_audioOutput->stop();      // 停止播放
+            m_audioOutput->reset();     // 清空缓冲区
+        }
+    }
+    m_audioCond.wakeAll();  // 保留以防其他地方使用
 }
 
 void DecoderThread::setPaused(bool pause)
@@ -235,7 +243,7 @@ void DecoderThread::run()
     }
 
     // FFmpeg 初始化
-    AVFormatContext *fmtCtx = nullptr;
+
     AVCodecContext *videoCodecCtx = nullptr;
     SwsContext *swsCtx = nullptr;
     AVFrame *videoFrame = nullptr;
@@ -246,8 +254,26 @@ void DecoderThread::run()
     int audioIdx = -1;
 
     // 1. 打开文件
-    if (avformat_open_input(&fmtCtx, localPath.toUtf8().constData(), nullptr, nullptr) < 0) {
+    // 在 run() 中，原 avformat_open_input 部分替换为：
+    AVFormatContext *fmtCtx = avformat_alloc_context();  // 手动分配
+    if (!fmtCtx) {
+        emit error("Failed to allocate format context");
+        return;
+    }
+
+    // 设置中断回调
+    fmtCtx->interrupt_callback.callback = [](void *opaque) -> int {
+        DecoderThread *self = static_cast<DecoderThread*>(opaque);
+        // 返回 1 表示中断，0 表示继续
+        return self->m_stop ? 1 : 0;
+    };
+    fmtCtx->interrupt_callback.opaque = this;
+
+    // 现在打开输入，传入已分配的 fmtCtx
+    int ret = avformat_open_input(&fmtCtx, localPath.toUtf8().constData(), nullptr, nullptr);
+    if (ret < 0) {
         emit error("Cannot open file: " + localPath);
+        avformat_free_context(fmtCtx);  // 注意，open_input 失败时 fmtCtx 可能为 nullptr，但此处我们传入了指针，需判断
         return;
     }
 
@@ -290,7 +316,7 @@ void DecoderThread::run()
                     m_actualOutHeight = videoCodecCtx->height;
 
                     // 安全限制最大尺寸（保留宽高比）
-                    const int MAX_W = 1280, MAX_H = 720;
+                    const int MAX_W = 1920, MAX_H = 1080;
                     if (m_actualOutWidth > MAX_W || m_actualOutHeight > MAX_H) {
                         double scale = qMin((double)MAX_W / m_actualOutWidth, (double)MAX_H / m_actualOutHeight);
                         m_displayWidth = (int)(m_actualOutWidth * scale);
@@ -548,6 +574,10 @@ void DecoderThread::run()
 
         int ret = av_read_frame(fmtCtx, packet);
         if (ret < 0) {
+            if (ret == AVERROR_EXIT) {   // 由中断回调触发
+                qDebug() << "Read interrupted due to stop request";
+                break;   // 退出 while (!m_stop) 循环
+            }
             // 如果从未解码出视频帧或只有一帧，且没有音频流 → 视为图片，暂停
             bool isImage = (m_decodedVideoFrames <= 1 && audioIdx < 0);
             if (isImage) {
@@ -647,7 +677,7 @@ void DecoderThread::run()
                         }
 
                         // 如果目标尺寸与当前实际输出尺寸不同，才重建
-                        if (dstW != m_actualOutWidth || dstH != m_actualOutHeight) {
+                        if (dstW < m_actualOutWidth || dstH < m_actualOutHeight) {
                             // 释放旧的 swsCtx（注意：swsCtx 当前正在被使用，但此处加锁后可以安全替换）
                             // 为了更安全，可以先新建再替换
                             SwsContext *newCtx = sws_getContext(
@@ -746,6 +776,12 @@ void DecoderThread::run()
 
                     if (samplesConverted > 0) {
                         int dataSize = samplesConverted * 2 * sizeof(int16_t);
+                        // ✅ 关键：写入前检查停止标志
+                        if (m_stop) {
+                            // 已请求停止，不写入，直接跳出循环
+                            av_frame_unref(audioFrame);
+                            break;
+                        }
                         // 直接写入，音量由 m_audioOutput->setVolume() 控制
                         m_audioDevice->write(m_audioBuffer.constData(), dataSize);
                         m_lastAudioWriteTime = QDateTime::currentMSecsSinceEpoch();
