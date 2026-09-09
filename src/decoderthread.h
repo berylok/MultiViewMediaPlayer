@@ -103,6 +103,22 @@ private:
     std::atomic<bool> m_muted{false};
 private:
     QMutex m_audioMutex;   // 保护 m_audioOutput 的访问
+
+    qint64 m_lastAudioToggleTime = 0;          // 上次切换时间戳（毫秒）
+    static constexpr qint64 MIN_TOGGLE_INTERVAL_MS = 200; // 最小间隔 200ms
+
+public:
+    void setDisplaySize(int width, int height);  // 由 UI 调用
+
+private:
+    QMutex m_sizeMutex;
+    int m_displayWidth = 0;
+    int m_displayHeight = 0;
+    bool m_sizeChanged = false;   // 标记是否需要更新
+
+    int m_actualOutWidth;              // 当前实际输出宽度
+    int m_actualOutHeight;             // 当前实际输出高度
+
 };
 
 #endif // DECODERTHREAD_H

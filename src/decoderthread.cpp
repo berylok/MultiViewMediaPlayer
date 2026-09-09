@@ -33,6 +33,12 @@ DecoderThread::DecoderThread(QObject *parent) : QThread(parent)
 
     m_audioClock = 0.0;
 
+    m_displayWidth = 0;
+    m_displayHeight = 0;
+    m_sizeChanged = false;
+    m_actualOutWidth = 0;
+    m_actualOutHeight = 0;
+
 }
 
 DecoderThread::~DecoderThread()
@@ -170,6 +176,7 @@ bool DecoderThread::initAudioOutput()
     }
 
     // 清理旧的音频输出
+    QMutexLocker locker(&m_audioMutex);
     if (m_audioOutput) {
         m_audioOutput->stop();
         delete m_audioOutput;
@@ -194,6 +201,7 @@ bool DecoderThread::initAudioOutput()
 
 void DecoderThread::cleanupAudioOutput()
 {
+    QMutexLocker locker(&m_audioMutex);
     if (m_audioOutput) {
         m_audioOutput->stop();
         delete m_audioOutput;
@@ -277,6 +285,20 @@ void DecoderThread::run()
             if (videoCodecCtx) {
                 avcodec_parameters_to_context(videoCodecCtx, codecPar);
                 if (avcodec_open2(videoCodecCtx, codec, nullptr) >= 0) {
+
+                    m_actualOutWidth = videoCodecCtx->width;
+                    m_actualOutHeight = videoCodecCtx->height;
+
+                    // 安全限制最大尺寸（保留宽高比）
+                    const int MAX_W = 1280, MAX_H = 720;
+                    if (m_actualOutWidth > MAX_W || m_actualOutHeight > MAX_H) {
+                        double scale = qMin((double)MAX_W / m_actualOutWidth, (double)MAX_H / m_actualOutHeight);
+                        m_displayWidth = (int)(m_actualOutWidth * scale);
+                        m_displayHeight = (int)(m_actualOutHeight * scale);
+                        // 但不应修改 m_actualOutWidth/Height，而是通过 m_sizeChanged 触发重建
+                        m_sizeChanged = true;
+                    }
+
                     swsCtx = sws_getContext(videoCodecCtx->width, videoCodecCtx->height, videoCodecCtx->pix_fmt,
                                             videoCodecCtx->width, videoCodecCtx->height, AV_PIX_FMT_RGB32,
                                             SWS_BICUBIC, nullptr, nullptr, nullptr);
@@ -302,6 +324,12 @@ void DecoderThread::run()
             m_audioCodecCtx = avcodec_alloc_context3(codec);
             if (m_audioCodecCtx) {
                 avcodec_parameters_to_context(m_audioCodecCtx, codecPar);
+                m_audioCodecCtx->pkt_timebase = fmtCtx->streams[audioIdx]->time_base;
+                // 同样对视频解码器也建议设置
+                if (videoCodecCtx) {
+                    videoCodecCtx->pkt_timebase = fmtCtx->streams[videoIdx]->time_base;
+                }
+
                 if (avcodec_open2(m_audioCodecCtx, codec, nullptr) >= 0) {
                     m_audioStreamIndex = audioIdx;
                     m_audioSampleRate = m_audioCodecCtx->sample_rate;
@@ -406,45 +434,48 @@ void DecoderThread::run()
     // 在主循环中修改音频状态检查
     while (!m_stop) {
         // 【优化】动态检查音频状态变化，防止频繁切换
+        // 在主循环中动态检查音频状态
         bool currentAudioEnabled = m_audioEnabled.loadRelaxed();
-
         if (currentAudioEnabled != lastAudioEnabled) {
-            if (currentAudioEnabled && !m_audioOutput && audioDecoderReady) {
-                // 启用音频，但限制重试次数
-                if (audioReinitCounter < 3) {  // 最多重试3次
-                    qDebug() << "Main loop: Enabling audio output (attempt" << audioReinitCounter + 1 << ")";
+            qint64 now = QDateTime::currentMSecsSinceEpoch();
+            if (now - m_lastAudioToggleTime < MIN_TOGGLE_INTERVAL_MS) {
+                // 忽略本次切换，保持 lastAudioEnabled 不变
+                m_audioEnabled.storeRelaxed(lastAudioEnabled);
+            } else {
+                m_lastAudioToggleTime = now;
+                if (currentAudioEnabled && !m_audioOutput && audioDecoderReady) {
+                    // 启用
                     if (initAudioOutput()) {
                         lastAudioEnabled = true;
                         audioReinitCounter = 0;
-                        audioInitAttempted = false;
                     } else {
-                        audioReinitCounter++;
-                        qWarning() << "Failed to init audio output, attempt" << audioReinitCounter;
-                        // 如果初始化失败，暂时禁用音频
                         m_audioEnabled.storeRelaxed(false);
                         lastAudioEnabled = false;
                     }
-                } else {
-                    qWarning() << "Audio init failed too many times, disabling permanently";
-                    m_audioEnabled.storeRelaxed(false);
+                } else if (!currentAudioEnabled && m_audioOutput) {
+                    // 禁用（带完全释放）
+                    qDebug() << "Main loop: Disabling audio output";
+                    {
+                        QMutexLocker locker(&m_audioMutex);
+                        m_audioOutput->stop();
+                        m_audioOutput->reset();
+                        // 等待停止完成
+                        while (m_audioOutput->state() != QAudio::StoppedState) {
+                            QThread::msleep(10);
+                        }
+                        delete m_audioOutput;
+                        m_audioOutput = nullptr;
+                        m_audioDevice = nullptr;
+                    }
                     lastAudioEnabled = false;
+                    audioReinitCounter = 0;
                 }
-            } else if (!currentAudioEnabled && m_audioOutput) {
-                // 禁用音频
-                qDebug() << "Main loop: Disabling audio output";
-                m_audioOutput->stop();
-                delete m_audioOutput;
-                m_audioOutput = nullptr;
-                m_audioDevice = nullptr;
-                lastAudioEnabled = false;
-                audioReinitCounter = 0;  // 重置重试计数
             }
         }
 
 
         // 处理跳转
         // 在 run() 函数中，替换原有的 seek 处理部分
-        // 在 run() 主循环的 seek 处理部分
         if (m_seeking) {
             double target;
             {
@@ -528,6 +559,8 @@ void DecoderThread::run()
             av_seek_frame(fmtCtx, -1, 0, AVSEEK_FLAG_BACKWARD);
             if (videoCodecCtx) avcodec_flush_buffers(videoCodecCtx);
             if (m_audioCodecCtx) avcodec_flush_buffers(m_audioCodecCtx);
+
+            QMutexLocker locker(&m_audioMutex);
             if (m_audioOutput) {
                 m_audioOutput->stop();
                 m_audioOutput->reset();
@@ -548,6 +581,7 @@ void DecoderThread::run()
             ret = avcodec_send_packet(videoCodecCtx, packet);
             if (ret >= 0) {
                 while (ret >= 0 && !m_stop) {
+
                     ret = avcodec_receive_frame(videoCodecCtx, videoFrame);
                     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
                     if (ret < 0) break;
@@ -585,15 +619,73 @@ void DecoderThread::run()
                         emit timeChanged(m_currentTime, m_duration);
                     }
 
+
+
+                    QMutexLocker locker(&m_sizeMutex);
+                    if (m_sizeChanged && videoCodecCtx && swsCtx && rgbFrame) {
+                        // 计算新的缩放尺寸（保持原始宽高比）
+                        int srcW = videoCodecCtx->width;
+                        int srcH = videoCodecCtx->height;
+                        int dstW = m_displayWidth;
+                        int dstH = m_displayHeight;
+
+                        // 如果目标尺寸为 0（未设置），则使用原始尺寸
+                        if (dstW <= 0 || dstH <= 0) {
+                            dstW = srcW;
+                            dstH = srcH;
+                        } else {
+                            // 保持宽高比
+                            double aspect = (double)srcW / srcH;
+                            if (dstW / aspect > dstH) {
+                                dstW = (int)(dstH * aspect);
+                            } else {
+                                dstH = (int)(dstW / aspect);
+                            }
+                            // 确保宽高为偶数（避免某些编解码器要求）
+                            dstW = (dstW / 2) * 2;
+                            dstH = (dstH / 2) * 2;
+                        }
+
+                        // 如果目标尺寸与当前实际输出尺寸不同，才重建
+                        if (dstW != m_actualOutWidth || dstH != m_actualOutHeight) {
+                            // 释放旧的 swsCtx（注意：swsCtx 当前正在被使用，但此处加锁后可以安全替换）
+                            // 为了更安全，可以先新建再替换
+                            SwsContext *newCtx = sws_getContext(
+                                srcW, srcH, videoCodecCtx->pix_fmt,
+                                dstW, dstH, AV_PIX_FMT_RGB32,
+                                SWS_BICUBIC, nullptr, nullptr, nullptr
+                                );
+                            if (newCtx) {
+                                // 重新分配 rgbFrame 缓冲区
+                                av_freep(&rgbFrame->data[0]);
+                                av_image_alloc(rgbFrame->data, rgbFrame->linesize,
+                                               dstW, dstH, AV_PIX_FMT_RGB32, 32);
+
+                                // 替换 swsCtx（加锁保护，避免与 sws_scale 同时使用）
+                                // 但注意：sws_scale 调用也在主循环中，需要确保原子切换
+                                // 简单做法：在视频帧处理循环中统一使用同一个 swsCtx，这里先释放再赋值
+                                sws_freeContext(swsCtx);
+                                swsCtx = newCtx;
+                                m_actualOutWidth = dstW;
+                                m_actualOutHeight = dstH;
+                                qDebug() << "Display size updated to" << dstW << "x" << dstH;
+                            }
+                        }
+                        m_sizeChanged = false;
+                    }
+
                     // 转换和显示
                     if (swsCtx && rgbFrame && rgbFrame->data[0]) {
                         sws_scale(swsCtx,
                                   videoFrame->data, videoFrame->linesize, 0, videoCodecCtx->height,
                                   rgbFrame->data, rgbFrame->linesize);
 
-                        QImage img(rgbFrame->data[0], videoCodecCtx->width, videoCodecCtx->height,
+                        // QImage img(rgbFrame->data[0], videoCodecCtx->width, videoCodecCtx->height,
+                                   // rgbFrame->linesize[0], QImage::Format_RGB32);
+                        // // 使用实际输出尺寸（即 m_actualOutWidth, m_actualOutHeight）
+                        QImage img(rgbFrame->data[0], m_actualOutWidth, m_actualOutHeight,
                                    rgbFrame->linesize[0], QImage::Format_RGB32);
-                        emit frameReady(img);
+                        emit frameReady(img.copy());
                         // ✅ 在这里递增计数
                         m_decodedVideoFrames++;
                     }
@@ -687,6 +779,8 @@ void DecoderThread::run()
 void DecoderThread::setMuted(bool muted)
 {
     m_muted = muted;
+
+    QMutexLocker locker(&m_audioMutex);
     if (m_audioOutput) {
         if (muted) {
             // 静音：将音量设为 0
@@ -698,6 +792,16 @@ void DecoderThread::setMuted(bool muted)
             m_audioOutput->setVolume(vol / 100.0f);
             qDebug() << "Unmuted (volume restored to" << vol << ")";
         }
+    }
+}
+
+void DecoderThread::setDisplaySize(int width, int height) {
+    QMutexLocker locker(&m_sizeMutex);
+    if (m_displayWidth != width || m_displayHeight != height) {
+        m_displayWidth = width;
+        m_displayHeight = height;
+        m_sizeChanged = true;
+        // 无需主动唤醒线程，主循环会定期检查
     }
 }
 
