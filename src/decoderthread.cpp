@@ -534,7 +534,7 @@ void DecoderThread::run()
 
                 // 重新初始化音频（若启用）
                 if (m_audioEnabled.loadRelaxed() && m_swrCtx && m_audioCodecCtx) {
-                    QMutexLocker locker(&m_audioMutex);
+
                     if (!initAudioOutput()) {
                         qWarning() << "Failed to reinit audio after seek";
                     }
