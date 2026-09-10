@@ -187,7 +187,6 @@ bool DecoderThread::initAudioOutput()
     QMutexLocker locker(&m_audioMutex);
     if (m_audioOutput) {
         m_audioOutput->stop();
-        delete m_audioOutput;
         m_audioOutput = nullptr;
         m_audioDevice = nullptr;
     }
@@ -478,27 +477,21 @@ void DecoderThread::run()
                         m_audioEnabled.storeRelaxed(false);
                         lastAudioEnabled = false;
                     }
-                } else if (!currentAudioEnabled && m_audioOutput) {
-                    // 禁用（带完全释放）
-                    qDebug() << "Main loop: Disabling audio output";
-                    {
+                    if (currentAudioEnabled && m_audioOutput && audioDecoderReady) {
+                        // 已存在 sink，只恢复
                         QMutexLocker locker(&m_audioMutex);
-                        m_audioOutput->stop();
-                        m_audioOutput->reset();
-                        // 等待停止完成
-                        while (m_audioOutput->state() != QAudio::StoppedState) {
-                            QThread::msleep(10);
+                        if (m_audioOutput->state() == QAudio::SuspendedState) {
+                            m_audioOutput->resume();
                         }
-                        delete m_audioOutput;
-                        m_audioOutput = nullptr;
-                        m_audioDevice = nullptr;
+                        m_audioOutput->setVolume(m_muted ? 0.0f : m_volume.loadRelaxed() / 100.0f);
+                        lastAudioEnabled = true;
+                    } else if (currentAudioEnabled && !m_audioOutput && audioDecoderReady) {
+                        // 真的从来没有创建过 sink，才走 init
+                        if (initAudioOutput()) { lastAudioEnabled = true; }
                     }
-                    lastAudioEnabled = false;
-                    audioReinitCounter = 0;
                 }
             }
         }
-
 
         // 处理跳转
         // 在 run() 函数中，替换原有的 seek 处理部分
@@ -579,13 +572,15 @@ void DecoderThread::run()
             if (videoCodecCtx) avcodec_flush_buffers(videoCodecCtx);
             if (m_audioCodecCtx) avcodec_flush_buffers(m_audioCodecCtx);
 
-            QMutexLocker locker(&m_audioMutex);
+
             if (m_audioOutput) {
-                m_audioOutput->stop();
-                m_audioOutput->reset();
-                m_audioDevice = m_audioOutput->start();
-                int currentVol = m_volume.loadRelaxed();
-                m_audioOutput->setVolume(currentVol / 100.0f);
+                QMutexLocker locker(&m_audioMutex);
+                if (m_audioOutput) {
+                    m_audioOutput->reset();   // 只丢弃待播数据，流保留
+                    if (m_audioOutput->state() == QAudio::StoppedState) {
+                        m_audioDevice = m_audioOutput->start();  // 仅在确实停掉时才重启
+                    }
+                }
             }
             lastFrameTime = 0;
             audioClock = 0.0;
@@ -800,6 +795,7 @@ void DecoderThread::run()
         avformat_close_input(&fmtCtx);
     }
 }
+
 
 void DecoderThread::setMuted(bool muted)
 {
