@@ -513,44 +513,33 @@ void DecoderThread::run()
             qDebug() << "Seeking to position:" << target;
 
             int64_t seekTarget = static_cast<int64_t>(target * m_duration * AV_TIME_BASE);
-            if (avformat_seek_file(fmtCtx, -1, INT64_MIN, seekTarget, seekTarget, AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_FRAME) >= 0) {
-                if (videoCodecCtx) avcodec_flush_buffers(videoCodecCtx);
+            if (avformat_seek_file(fmtCtx, -1, INT64_MIN, seekTarget, seekTarget,
+                                   AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_FRAME) >= 0)
+            {
+                if (videoCodecCtx)   avcodec_flush_buffers(videoCodecCtx);
                 if (m_audioCodecCtx) avcodec_flush_buffers(m_audioCodecCtx);
 
-                // ---- 强制释放音频资源 ----
+                // ★ 关键改动：不 delete/新建，只丢弃音频缓冲
                 {
                     QMutexLocker locker(&m_audioMutex);
                     if (m_audioOutput) {
-                        m_audioOutput->stop();
-                        m_audioOutput->reset();
-                        delete m_audioOutput;
-                        m_audioOutput = nullptr;
-                        m_audioDevice = nullptr;
-                    }
-                }
-                // 关键：等待资源释放（实测 50ms 足够）
-                QThread::msleep(50);
-                QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
-
-                // 重新初始化音频（若启用）
-                if (m_audioEnabled.loadRelaxed() && m_swrCtx && m_audioCodecCtx) {
-
-                    if (!initAudioOutput()) {
-                        qWarning() << "Failed to reinit audio after seek";
+                        m_audioOutput->reset();      // 丢弃尚未播放的数据
+                        // 如果 sink 已停止状态，需要重新 start 拿 device
+                        if (m_audioOutput->state() == QAudio::StoppedState) {
+                            m_audioDevice = m_audioOutput->start();
+                        }
                     }
                 }
 
                 // 重置时间
-                lastFrameTime = 0;
-                m_currentTime = target * m_duration;
-                audioClock = 0.0;
+                lastFrameTime    = 0;
+                m_currentTime    = target * m_duration;
+                audioClock       = 0.0;
                 m_lastAudioWriteTime = 0;
 
                 emit positionChanged(target);
                 emit timeChanged(m_currentTime, m_duration);
                 qDebug() << "Seek completed, new time:" << m_currentTime;
-            } else {
-                qWarning() << "Seek failed for target:" << seekTarget;
             }
 
             continue;
