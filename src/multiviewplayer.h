@@ -84,6 +84,14 @@ private:
     bool m_cycleReplaceEnabled = true;  // 循环替换开关
     QList<VideoRenderWidget*> m_videoPlayOrder;
 
+private slots:
+    void onOpenVideosClicked();   // 新加，菜单/按钮触发
+    void openVideos(int count);   // 实际干活
+
+private:
+    QAction *m_open18Action = nullptr;    // 直接开 18 路
+    QAction *m_openMultiAction = nullptr; // 弹对话框选路数
+
 };
 
 #endif // MULTIVIEWPLAYER_H

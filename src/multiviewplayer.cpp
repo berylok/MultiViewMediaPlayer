@@ -18,11 +18,124 @@
 #include <QToolButton>
 #include <QSlider>
 #include <QAction>
+#include <QInputDialog>
 
-static const QString MEDIA_FILTER =
-    "视频文件 (*.mp4 *.avi *.mkv *.mov *.webm *.ts);;"
-    "图片文件 (*.jpg *.jpeg *.png *.bmp *.gif *.tiff *.tif);;"
-    "所有文件 (*.*)";
+// multiviewplayer.cpp 顶部已经 include ffmpeg 的话直接用
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+}
+
+struct VideoProbe {
+    bool    ok = false;
+    int     width = 0;
+    int     height = 0;
+    double  fps = 0.0;
+    QString codecName;
+    qint64  bitrate = 0;   // bps
+    qint64  durationMs = 0;
+    double  pixelsPerSec = 0.0;   // width*height*fps，综合负担指标
+};
+
+// 快速探测视频信息（主线程里调用，只读，不建解码器）
+static VideoProbe probeVideo(const QString &path)
+{
+    VideoProbe info;
+
+    AVFormatContext *fmt = nullptr;
+    if (avformat_open_input(&fmt, path.toUtf8().constData(), nullptr, nullptr) < 0)
+        return info;
+
+    if (avformat_find_stream_info(fmt, nullptr) < 0) {
+        avformat_close_input(&fmt);
+        return info;
+    }
+
+    int vIdx = -1;
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            vIdx = i;
+            break;
+        }
+    }
+    if (vIdx < 0) {
+        avformat_close_input(&fmt);
+        return info;
+    }
+
+    AVCodecParameters *par = fmt->streams[vIdx]->codecpar;
+    AVRational fr = fmt->streams[vIdx]->avg_frame_rate;
+    if (fr.num <= 0) fr = fmt->streams[vIdx]->r_frame_rate;
+
+    info.ok          = true;
+    info.width       = par->width;
+    info.height      = par->height;
+    info.fps         = av_q2d(fr);
+    info.codecName   = QString::fromUtf8(avcodec_get_name(par->codec_id));
+    info.bitrate     = par->bit_rate;
+    info.durationMs  = (fmt->duration != AV_NOPTS_VALUE)
+                          ? (fmt->duration / (AV_TIME_BASE / 1000))
+                          : 0;
+    info.pixelsPerSec = (double)info.width * info.height * info.fps;
+
+    avformat_close_input(&fmt);
+    return info;
+}
+
+// 返回 true = 重负载，需要提示
+static bool isHeavyVideo(const VideoProbe &v, int openCount,
+                         QString *reason)
+{
+    if (!v.ok) return false;
+
+    QStringList warnings;
+
+    // 1. 分辨率过高
+    if (v.width * v.height >= 3840*2160) {
+        warnings << QString("分辨率 4K（%1×%2）").arg(v.width).arg(v.height);
+    } else if (v.width * v.height >= 2560*1440) {
+        warnings << QString("分辨率 2K（%1×%2）").arg(v.width).arg(v.height);
+    }
+
+    // 2. 编码重（HEVC / AV1 软解贵）
+    if (v.codecName.compare("hevc", Qt::CaseInsensitive) == 0) {
+        warnings << "HEVC 编码（软解 CPU 约 H.264 的 2~3 倍）";
+    } else if (v.codecName.compare("av1", Qt::CaseInsensitive) == 0) {
+        warnings << "AV1 编码（软解 CPU 极高）";
+    } else if (v.codecName.compare("vp9", Qt::CaseInsensitive) == 0) {
+        warnings << "VP9 编码（软解 CPU 较高）";
+    }
+
+    // 3. 高帧率
+    if (v.fps > 50.0) {
+        warnings << QString("高帧率 %1 fps").arg(v.fps, 0, 'f', 1);
+    }
+
+    // 4. 综合指标：像素×帧率
+    //    1080p30 ≈ 6220 万/秒
+    //    1080p60 ≈ 1.24 亿/秒
+    //    4K30    ≈ 2.49 亿/秒
+    //    4K60    ≈ 4.98 亿/秒
+    const double threshold = 1.5e8;   // 1.5 亿像素/秒以上算重
+    if (v.pixelsPerSec >= threshold) {
+        warnings << QString("像素吞吐 %1 亿/秒")
+                        .arg(v.pixelsPerSec / 1e8, 0, 'f', 2);
+    }
+
+    // 5. 数量放大：warnings 非空 且 路数 >= 9
+    if (warnings.isEmpty()) return false;
+
+    QString msg = QString("检测到该视频负载较高：\n\n• %1\n\n"
+                          "同时打开 %2 路，CPU 可能接近满载，画面可能卡顿。")
+                      .arg(warnings.join("\n• "))
+                      .arg(openCount);
+
+    if (reason) *reason = msg;
+    return true;
+}
+
+
+
 
 MultiViewPlayer::MultiViewPlayer(QWidget *parent) : QMainWindow(parent)
 {
@@ -84,7 +197,9 @@ void MultiViewPlayer::setupUi()
     m_closeAction = m_toolBar->addAction("❌ 关闭当前");
     m_fullScreenAction = m_toolBar->addAction("⛶ 全屏当前");
     // 【新增】添加批量打开18个视频的按钮
-    m_bulkOpenAction = m_toolBar->addAction("📁 打开18个视频");
+    m_open18Action    = m_toolBar->addAction("📁 打开18路视频");
+    m_openMultiAction = m_toolBar->addAction("📁 打开多路视频");
+
     // 在工具栏末尾添加“关闭全部”按钮
     m_closeAllAction = m_toolBar->addAction("🚫 关闭全部");
     connect(m_closeAllAction, &QAction::triggered, this, &MultiViewPlayer::closeAllVideos);
@@ -101,7 +216,10 @@ void MultiViewPlayer::setupUi()
             toggleFullScreen(m_activeVideo);
         }
     });
-    connect(m_bulkOpenAction, &QAction::triggered, this, &MultiViewPlayer::openEighteenVideos);  // 新连接
+
+    connect(m_open18Action, &QAction::triggered, this, &MultiViewPlayer::openEighteenVideos);
+
+    connect(m_openMultiAction, &QAction::triggered, this, &MultiViewPlayer::onOpenVideosClicked);  // 新连接
 
     // 音量控制
     m_globalVolumeSlider = new QSlider(Qt::Horizontal, this);
@@ -345,10 +463,14 @@ void MultiViewPlayer::updateLayout()
 void MultiViewPlayer::addVideo()
 {
     QFileDialog dialog(this);
-    dialog.setWindowTitle("选择媒体文件");
+    dialog.setWindowTitle("选择视频文件");
     dialog.setFileMode(QFileDialog::ExistingFiles);
+
+    // 关键：使用系统原生对话框，Qt 不会去读注册表获取图标信息
     dialog.setOption(QFileDialog::DontUseNativeDialog, false);
-    dialog.setNameFilter(MEDIA_FILTER);   // 替换原先的过滤器
+
+    // 设置过滤器（原生对话框也会读注册表，但速度更快）
+    dialog.setNameFilter("视频文件 (*.mp4 *.avi *.mkv *.mov *.webm *.ts)");
 
     if (dialog.exec()) {
         QStringList files = dialog.selectedFiles();
@@ -417,7 +539,7 @@ void MultiViewPlayer::openEighteenVideos()
     dialog.setWindowTitle("选择源视频文件（将同步打开18个实例）");
     dialog.setFileMode(QFileDialog::ExistingFile);
     dialog.setOption(QFileDialog::DontUseNativeDialog, false);
-    dialog.setNameFilter(MEDIA_FILTER);
+    dialog.setNameFilter("视频文件 (*.mp4 *.avi *.mkv *.mov *.webm *.ts)");
 
     if (!dialog.exec()) {
         return;
@@ -461,26 +583,8 @@ void MultiViewPlayer::openEighteenVideos()
         m_videoWidgets.append(vid);
         addedCount++;
 
-        // // 延迟播放，避免同时加载导致卡顿
-        // QTimer::singleShot(i * 0, this, [vid, sourceFile]() {
-        //     vid->playFile(sourceFile);
-        // });
-
         vid->playFile(sourceFile);
     }
-
-    // // 设置第一个视频为活动窗口（在主视频创建时直接设置）
-    // if (!m_videoWidgets.isEmpty() && !m_muted) {
-    //     m_activeVideo = m_videoWidgets.first();
-    //     m_activeVideo->setMuted(false);
-    //     m_activeVideo->setVolume(m_globalVolume);
-    //     m_activeVideo->setAudioEnabled(true);  // 确保音频已启用
-    //     qDebug() << "Set first video as active with volume:" << m_globalVolume;
-    // } else if (!m_videoWidgets.isEmpty() && m_muted) {
-    //     m_activeVideo = m_videoWidgets.first();
-    //     m_activeVideo->setMuted(true);
-    //     m_activeVideo->setVolume(0.0f);
-    // }
 
     // 启用布局更新并刷新
     m_updatingLayout = false;
@@ -679,3 +783,79 @@ void MultiViewPlayer::closeAllVideos()
 
 }
 
+
+void MultiViewPlayer::onOpenVideosClicked()
+{
+    // 让用户选：3 / 5 / 9 / 18 / 自定义
+    QStringList options;
+    options << "3 路（流畅）"
+            << "5 路（流畅）"
+            << "9 路（推荐）"
+            << "18 路（高性能）"
+            << "自定义...";
+
+    bool ok = false;
+    QString choice = QInputDialog::getItem(
+        this,
+        "选择打开路数",
+        "同时打开几个视频？",
+        options,
+        2,      // 默认选中"9 路"
+        false,  // 不可编辑（只能选）
+        &ok);
+
+    if (!ok) return;
+
+    int count = 0;
+    if (choice.startsWith("3"))        count = 3;
+    else if (choice.startsWith("5"))   count = 5;
+    else if (choice.startsWith("9"))   count = 9;
+    else if (choice.startsWith("18"))  count = 18;
+    else {
+        // 自定义
+        count = QInputDialog::getInt(
+            this, "自定义路数", "输入数量（1 ~ 18）:",
+            2, 1, 18, 1, &ok);
+        if (!ok) return;
+    }
+
+    openVideos(count);
+}
+
+void MultiViewPlayer::openVideos(int count)
+{
+    QFileDialog dialog(this);
+    dialog.setWindowTitle(QString("选择源视频文件（将同步打开%1个实例）").arg(count));
+    dialog.setFileMode(QFileDialog::ExistingFile);
+    dialog.setOption(QFileDialog::DontUseNativeDialog, false);
+    dialog.setNameFilter("视频文件 (*.mp4 *.avi *.mkv *.mov *.webm *.ts)");
+
+    if (!dialog.exec()) return;
+    QString sourceFile = dialog.selectedFiles().first();
+
+    // ★★★ 新增：视频体检 ★★★
+    VideoProbe vp = probeVideo(sourceFile);
+    QString warnMsg;
+    if (isHeavyVideo(vp, count, &warnMsg)) {
+        QMessageBox::StandardButton btn = QMessageBox::warning(
+            this,
+            "视频负载较高",
+            warnMsg + "\n\n是否继续打开？",
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No);        // 默认选"否"
+
+        if (btn != QMessageBox::Yes) {
+            return;   // 用户取消
+        }
+    }
+    // ★★★ 检查结束 ★★★
+
+
+    // ★ 关键：不用清空，直接循环调用 addVideoWidget
+    // 它会自动处理"未满追加"和"满了替换最旧"
+    const int TARGET_COUNT = qBound(1, count, MAX_VIDEOS);
+
+    for (int i = 0; i < TARGET_COUNT; ++i) {
+        addVideoWidget(sourceFile);
+    }
+}
