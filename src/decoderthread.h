@@ -1,6 +1,7 @@
 #ifndef DECODERTHREAD_H
 #define DECODERTHREAD_H
 
+#include "videometainfo.h"
 #include <QThread>
 #include <QMutex>
 #include <QWaitCondition>
@@ -49,6 +50,8 @@ signals:
     void error(QString message);
     void volumeChanged(int volume);
     void audioStateChanged(bool enabled);  // 音频状态变化信号
+
+    void videoInfoReady(const VideoMetaInfo &info);
 
 protected:
     void run() override;

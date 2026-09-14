@@ -10,6 +10,8 @@
 #include <QElapsedTimer>  // 添加这一行
 #include <QTimer>
 
+#include "videometainfo.h"
+
 class VideoRenderWidget;
 
 class MultiViewPlayer : public QMainWindow
@@ -91,6 +93,10 @@ private slots:
 private:
     QAction *m_open18Action = nullptr;    // 直接开 18 路
     QAction *m_openMultiAction = nullptr; // 弹对话框选路数
+
+private:
+    QString m_baseTitle;   // ★ 保存原始窗口标题
+
 
 };
 

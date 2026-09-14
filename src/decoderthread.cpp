@@ -286,6 +286,9 @@ void DecoderThread::run()
         return;
     }
 
+
+
+
     // 3. 查找视频和音频流
     for (unsigned i = 0; i < fmtCtx->nb_streams; ++i) {
         if (fmtCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && videoIdx < 0) {
@@ -304,6 +307,37 @@ void DecoderThread::run()
         emit durationChanged(m_duration);
     }
 
+    // ========== ★ 收集视频信息，发给 UI ==========
+    if (videoIdx >= 0) {
+        AVStream *vst = fmtCtx->streams[videoIdx];
+        AVCodecParameters *par = vst->codecpar;
+
+        VideoMetaInfo info;
+        info.width  = par->width;
+        info.height = par->height;
+        info.codec  = QString::fromUtf8(avcodec_get_name(par->codec_id));
+
+        AVRational fr = vst->avg_frame_rate;
+        if (fr.num <= 0) fr = vst->r_frame_rate;
+        info.fps = av_q2d(fr);
+        if (info.fps <= 0) info.fps = 25.0;
+
+        if (par->bit_rate > 0) {
+            info.bitrate = par->bit_rate;
+        } else if (fmtCtx->bit_rate > 0) {
+            info.bitrate = fmtCtx->bit_rate;
+        }
+
+        emit videoInfoReady(info);
+
+        qDebug() << ">>> DecoderThread emit videoInfoReady:"
+                 << info.width << "x" << info.height
+                 << info.codec << info.fps << "fps"
+                 << info.bitrate / 1000 << "kbps";
+    }
+    // =================================================
+
+
     // ========== 初始化视频解码器 ==========
     if (videoIdx >= 0) {
         AVCodecParameters *codecPar = fmtCtx->streams[videoIdx]->codecpar;
@@ -317,11 +351,26 @@ void DecoderThread::run()
 
 
 
+                    // 让 m_actualOut* 与 rgbFrame 实际尺寸一致
+                    m_actualOutWidth  = videoCodecCtx->width;
+                    m_actualOutHeight = videoCodecCtx->height;
 
+                    //const int MAX_W = 1280*0.8, MAX_H = 720*0.8;
+                    const int MAX_W = 1280, MAX_H = 720;
 
-                    // 不缩放：直接用源尺寸
-                    m_displayWidth    = videoCodecCtx->width;
-                    m_displayHeight   = videoCodecCtx->height;
+                    if (m_actualOutWidth > MAX_W || m_actualOutHeight > MAX_H) {
+                        double scale = qMin((double)MAX_W / m_actualOutWidth,
+                                            (double)MAX_H / m_actualOutHeight);
+                        m_displayWidth  = (int)(m_actualOutWidth * scale);
+                        m_displayHeight = (int)(m_actualOutHeight * scale);
+                        m_sizeChanged = true;
+                    } else {
+                        m_displayWidth  = m_actualOutWidth;
+                        m_displayHeight = m_actualOutHeight;
+                        m_sizeChanged = false;   // 不需要后续重建
+                    }
+
+                    // 让 m_actualOut* 与 rgbFrame 实际尺寸一致
                     m_actualOutWidth  = m_displayWidth;
                     m_actualOutHeight = m_displayHeight;
 
@@ -338,7 +387,9 @@ void DecoderThread::run()
                         swsCtx = sws_getContext(
                             videoCodecCtx->width, videoCodecCtx->height, srcFmt,
                             m_displayWidth,       m_displayHeight,       AV_PIX_FMT_RGB32,
-                            SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+                            SWS_BICUBIC, nullptr, nullptr, nullptr);
+                        // SWS_FAST_BILINEAR SWS_BILINEAR 可能更快，
+                        // 但实际感受不到优势并且放大后有条纹影响观感
 
                         if (!swsCtx) {
                             qWarning() << "sws_getContext failed";
@@ -658,6 +709,7 @@ void DecoderThread::run()
                         emit positionChanged(position);
                         emit timeChanged(m_currentTime, m_duration);
                     }
+
 
                     // 转换和显示
                     if (swsCtx && rgbFrame && rgbFrame->data[0]) {

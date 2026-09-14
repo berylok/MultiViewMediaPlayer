@@ -1,6 +1,7 @@
 #ifndef VIDEORENDERWIDGET_H
 #define VIDEORENDERWIDGET_H
 
+#include "decoderthread.h"
 #include <QWidget>
 #include <QImage>
 #include <QMutex>
@@ -8,6 +9,9 @@
 #include <QToolButton>
 #include <QSlider>
 #include <QLabel>
+
+#include "videometainfo.h"
+
 
 class DecoderThread;
 
@@ -37,11 +41,19 @@ public:
     double getDuration() const;
     double getCurrentTime() const;
 
+    // ★ 新增
+    const VideoMetaInfo& info() const { return m_info; }
+    bool hasInfo() const { return m_hasInfo; }
+
+
+
 signals:
     void closeRequested();
     void fullScreenRequested();
     void fullScreenStateChanged(bool fullScreen);
     void exitedFullScreen();
+signals:
+    void videoInfoReady(const VideoMetaInfo &info);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -97,6 +109,10 @@ public:
 
 private:
     bool m_audioEnabled;
+
+    VideoMetaInfo m_info;
+    bool m_hasInfo = false;
+
 
 };
 

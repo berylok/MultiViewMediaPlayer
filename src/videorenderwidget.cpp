@@ -18,6 +18,7 @@ VideoRenderWidget::VideoRenderWidget(QWidget *parent) : QWidget(parent)
     setFocusPolicy(Qt::StrongFocus);
     m_audioEnabled = false;  // 默认不启用音频
 
+
 }
 
 VideoRenderWidget::~VideoRenderWidget()
@@ -77,6 +78,15 @@ void VideoRenderWidget::playFile(const QString &path)
     connect(m_thread, &DecoderThread::durationChanged, this, &VideoRenderWidget::onDurationChanged);
     connect(m_thread, &DecoderThread::positionChanged, this, &VideoRenderWidget::onPositionChanged);
     connect(m_thread, &DecoderThread::timeChanged, this, &VideoRenderWidget::onTimeChanged);
+    connect(m_thread, &DecoderThread::videoInfoReady, this,
+            [this](const VideoMetaInfo &info) {
+                m_info = info;
+                m_hasInfo = true;
+                emit videoInfoReady(info);   // 继续转发给 MultiViewPlayer
+                qDebug() << ">>> received info:" << info.width << "x" << info.height
+                         << info.codec << info.fps << "fps";
+            });
+
 
     m_thread->setFile(path);
 

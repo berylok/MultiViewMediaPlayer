@@ -139,6 +139,9 @@ static bool isHeavyVideo(const VideoProbe &v, int openCount,
 
 MultiViewPlayer::MultiViewPlayer(QWidget *parent) : QMainWindow(parent)
 {
+    m_baseTitle = "MultiViewMediaPlayer";             // 兜底
+
+
     setAcceptDrops(true);
     setupUi();
     setupGlobalActions();
@@ -160,9 +163,8 @@ MultiViewPlayer::MultiViewPlayer(QWidget *parent) : QMainWindow(parent)
         m_muteButton->setIcon(style()->standardIcon(QStyle::SP_MediaVolume));
     }
 
-    // if (m_videoWidgets.isEmpty()) {
-    //     addVideoWidget();
-    // }
+
+
 }
 
 MultiViewPlayer::~MultiViewPlayer()
@@ -502,6 +504,17 @@ void MultiViewPlayer::addVideoWidget(const QString &filePath)
 
     vid->setPaused(false);
 
+    connect(vid, &VideoRenderWidget::videoInfoReady, this,
+            [this, vid](const VideoMetaInfo &info) {
+                if (m_activeVideo != vid) return;
+                QString infoStr = QString("%1×%2  %3  %4fps  %5 kbps")
+                                      .arg(info.width).arg(info.height)
+                                      .arg(info.codec)
+                                      .arg(info.fps, 0, 'f', 2)
+                                      .arg(info.bitrate / 1000);
+                setWindowTitle(m_baseTitle + "  —  " + infoStr);   // ★ 拼接
+            });
+
     connect(vid, &VideoRenderWidget::closeRequested, this, [this, vid]() {
         removeVideoWidget(vid);
     });
@@ -763,6 +776,20 @@ void MultiViewPlayer::setActiveVideo(VideoRenderWidget *widget)
     m_videoPlayOrder.removeOne(widget);
     m_videoPlayOrder.append(widget);
 
+
+
+    // ★ 更新标题
+    if (widget->hasInfo()) {
+        const VideoMetaInfo &info = widget->info();
+        QString infoStr = QString("%1×%2  %3  %4fps  %5 kbps")
+                              .arg(info.width).arg(info.height)
+                              .arg(info.codec)
+                              .arg(info.fps, 0, 'f', 2)
+                              .arg(info.bitrate / 1000);
+        setWindowTitle(m_baseTitle + "  —  " + infoStr);       // ★ 拼接
+    } else {
+        setWindowTitle(m_baseTitle + "  —  视频加载中...");     // ★ 拼接
+    }
 
 }
 
