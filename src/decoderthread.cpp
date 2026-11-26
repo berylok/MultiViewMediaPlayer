@@ -21,7 +21,9 @@ DecoderThread::DecoderThread(QObject *parent) : QThread(parent)
     m_seeking = false;
     m_seekTarget = 0.0;
     m_volume.storeRelaxed(100);
-    m_audioEnabled.storeRelaxed(true);  // 默认启用音频
+    m_audioEnabled.storeRelaxed(true);
+    m_audioFlush.store(false);          // ★ 加
+    m_muted = false;                     // ★ 加
     m_audioCodecCtx = nullptr;
     m_audioStreamIndex = -1;
     m_swrCtx = nullptr;
@@ -31,9 +33,8 @@ DecoderThread::DecoderThread(QObject *parent) : QThread(parent)
     m_audioOutput = nullptr;
     m_audioDevice = nullptr;
     m_actualAudioSampleRate = 0;
-
     m_audioClock = 0.0;
-
+    m_lastAudioWriteTime = 0;
 }
 
 DecoderThread::~DecoderThread()
@@ -105,52 +106,64 @@ double DecoderThread::getCurrentTime() const
     return m_currentTime;
 }
 
-void DecoderThread::setVolume(int volume) {
+void DecoderThread::setVolume(int volume)
+{
     int newVol = qBound(0, volume, 100);
-    int oldVol = m_volume.loadRelaxed();
-    if (oldVol != newVol) {
-        m_volume.storeRelaxed(newVol);
-        emit volumeChanged(newVol);
+    m_volume.storeRelaxed(newVol);       // 无条件更新
+    emit volumeChanged(newVol);
 
-        // 立即应用音量到音频输出
-        QMutexLocker locker(&m_audioMutex);  // 新增互斥量，保护 m_audioOutput
-        if (m_audioOutput) {
-            m_audioOutput->setVolume(newVol / 100.0f);
-        }
+    QMutexLocker locker(&m_audioMutex);
+    if (m_audioOutput) {
+        int applied = m_muted ? 0 : newVol;
+        m_audioOutput->setVolume(applied / 100.0f);
     }
 }
+
 // 动态启用音频
 // 修改 enableAudio() 函数
 void DecoderThread::enableAudio()
 {
-    // 避免重复启用
     if (m_audioEnabled.loadRelaxed()) {
         qDebug() << "enableAudio() - Audio already enabled, skipping";
         return;
     }
-
     qDebug() << "DecoderThread::enableAudio() - Enabling audio dynamically";
     m_audioEnabled.storeRelaxed(true);
 
-    // 如果已经在运行且音频流索引有效，尝试初始化音频输出
-    if (isRunning() && m_audioStreamIndex >= 0) {
-        // 使用信号而不是直接在主循环中处理
-        qDebug() << "Audio will be enabled on next frame";
+    QMutexLocker locker(&m_audioMutex);
+    if (m_audioOutput) {
+        int vol = m_muted ? 0 : m_volume.loadRelaxed();
+        m_audioOutput->setVolume(vol / 100.0f);
+        if (m_audioOutput->state() == QAudio::SuspendedState) {
+            m_audioOutput->resume();
+        } else if (m_audioOutput->state() == QAudio::StoppedState) {
+            m_audioDevice = m_audioOutput->start();
+        }
+        qDebug() << "Audio enabled, vol:" << vol
+                 << "state:" << m_audioOutput->state();
+    } else {
+        qDebug() << "Audio enabled, no sink yet (will be created in main loop)";
     }
+    // ★ 删掉 m_audioFlush.store(true); —— enable 不该触发严格 flush
     emit audioStateChanged(true);
 }
 
 // 修改 disableAudio() 函数
 void DecoderThread::disableAudio()
 {
-    // 避免重复禁用
     if (!m_audioEnabled.loadRelaxed()) {
         qDebug() << "disableAudio() - Audio already disabled, skipping";
         return;
     }
-
     qDebug() << "DecoderThread::disableAudio() - Disabling audio dynamically";
     m_audioEnabled.storeRelaxed(false);
+
+    QMutexLocker locker(&m_audioMutex);
+    if (m_audioOutput) {
+        m_audioOutput->setVolume(0.0f);
+        m_audioOutput->suspend();       // ★ 无条件 suspend
+        qDebug() << "Audio disabled, state:" << m_audioOutput->state();
+    }
     emit audioStateChanged(false);
 }
 
@@ -172,34 +185,47 @@ bool DecoderThread::initAudioOutput()
     format.setSampleFormat(QAudioFormat::Int16);
 
     QAudioDevice device = QMediaDevices::defaultAudioOutput();
-
     if (!device.isFormatSupported(format)) {
         qWarning() << "Audio format not supported:" << m_actualAudioSampleRate << "Hz";
         return false;
     }
 
-    QMutexLocker locker(&m_audioMutex);  // 新增互斥量，保护 m_audioOutput
-    // 清理旧的音频输出
+    QMutexLocker locker(&m_audioMutex);
+
+    // ★ 只要 sink 存在就复用，不比较 format（PipeWire 会 resample，比较必然不等）
     if (m_audioOutput) {
-        m_audioOutput->stop();
-        delete m_audioOutput;
-        m_audioOutput = nullptr;
-        m_audioDevice = nullptr;
+        int vol = m_muted ? 0 : m_volume.loadRelaxed();
+        m_audioOutput->setVolume(vol / 100.0f);
+        if (m_audioOutput->state() == QAudio::SuspendedState) {
+            m_audioOutput->resume();
+        } else if (m_audioOutput->state() == QAudio::StoppedState) {
+            m_audioDevice = m_audioOutput->start();
+        }
+        qDebug() << "Reusing audio sink, state:" << m_audioOutput->state()
+                 << "sinkRate:" << m_audioOutput->format().sampleRate()
+                 << "reqRate:" << format.sampleRate();
+        return true;
     }
 
+    // 首次创建
     m_audioOutput = new QAudioSink(device, format);
-    int initVol = m_volume.loadRelaxed();
+    int initVol = m_muted ? 0 : m_volume.loadRelaxed();
     m_audioOutput->setVolume(initVol / 100.0f);
     m_audioDevice = m_audioOutput->start();
 
     if (m_audioDevice) {
-        qDebug() << "Audio output initialized dynamically:"
-                 << m_actualAudioSampleRate << "Hz, 2 channels, S16, volume:" << initVol;
+        qDebug() << "Audio output created:" << m_actualAudioSampleRate
+                 << "Hz, vol:" << initVol
+                 << "actual:" << m_audioOutput->format().sampleRate();
         return true;
-    } else {
-        qWarning() << "Failed to start audio output";
-        return false;
     }
+
+    qWarning() << "Failed to start audio output";
+    m_audioOutput->stop();
+    delete m_audioOutput;
+    m_audioOutput = nullptr;
+    m_audioDevice = nullptr;
+    return false;
 }
 
 void DecoderThread::cleanupAudioOutput()
@@ -351,28 +377,38 @@ void DecoderThread::run()
 
 
 
-                    // 让 m_actualOut* 与 rgbFrame 实际尺寸一致
-                    m_actualOutWidth  = videoCodecCtx->width;
-                    m_actualOutHeight = videoCodecCtx->height;
+                    // ★ 关键修复：取 SAM（采样宽高比），把非方形像素转为方形像素
+                    AVRational sar = av_guess_sample_aspect_ratio(fmtCtx, fmtCtx->streams[videoIdx], nullptr);
+                    if (sar.num <= 0 || sar.den <= 0) {
+                        sar = av_make_q(1, 1);      // 无效则按方形像素处理
+                    }
+                    videoCodecCtx->sample_aspect_ratio = sar;   // 部分解码器依赖它
 
-                    //const int MAX_W = 1280*0.8, MAX_H = 720*0.8;
+                    const int codedWidth  = videoCodecCtx->width;
+                    const int codedHeight = videoCodecCtx->height;
+
+                    // 显示宽度 = 编码宽度 × SAR；高度不变
+                    int displayW = static_cast<int>(codedWidth * av_q2d(sar) + 0.5);
+                    int displayH = codedHeight;
+
                     const int MAX_W = 1280, MAX_H = 720;
-
-                    if (m_actualOutWidth > MAX_W || m_actualOutHeight > MAX_H) {
-                        double scale = qMin((double)MAX_W / m_actualOutWidth,
-                                            (double)MAX_H / m_actualOutHeight);
-                        m_displayWidth  = (int)(m_actualOutWidth * scale);
-                        m_displayHeight = (int)(m_actualOutHeight * scale);
+                    if (displayW > MAX_W || displayH > MAX_H) {
+                        double scale = qMin((double)MAX_W / displayW, (double)MAX_H / displayH);
+                        m_displayWidth  = static_cast<int>(displayW * scale);
+                        m_displayHeight = static_cast<int>(displayH * scale);
                         m_sizeChanged = true;
                     } else {
-                        m_displayWidth  = m_actualOutWidth;
-                        m_displayHeight = m_actualOutHeight;
-                        m_sizeChanged = false;   // 不需要后续重建
+                        m_displayWidth  = displayW;
+                        m_displayHeight = displayH;
+                        m_sizeChanged = false;
                     }
 
-                    // 让 m_actualOut* 与 rgbFrame 实际尺寸一致
                     m_actualOutWidth  = m_displayWidth;
                     m_actualOutHeight = m_displayHeight;
+
+                    qDebug() << ">>> Video: coded" << codedWidth << "x" << codedHeight
+                             << "SAR" << sar.num << "/" << sar.den
+                             << "-> display" << m_displayWidth << "x" << m_displayHeight;
 
                     videoFrame = av_frame_alloc();
                     rgbFrame   = av_frame_alloc();
@@ -520,7 +556,6 @@ void DecoderThread::run()
 
     // 音频状态跟踪
     // 在主循环开始，定义局部变量跟踪状态
-    bool lastAudioEnabled = m_audioEnabled.loadRelaxed();
     bool audioInitAttempted = false;  // 防止重复初始化
     int audioReinitCounter = 0;  // 防止反复重试
 
@@ -530,40 +565,18 @@ void DecoderThread::run()
         // 【优化】动态检查音频状态变化，防止频繁切换
         bool currentAudioEnabled = m_audioEnabled.loadRelaxed();
 
-        if (currentAudioEnabled != lastAudioEnabled) {
-            if (currentAudioEnabled && !m_audioOutput && audioDecoderReady) {
-                // 启用音频，但限制重试次数
-                if (audioReinitCounter < 3) {  // 最多重试3次
-                    qDebug() << "Main loop: Enabling audio output (attempt" << audioReinitCounter + 1 << ")";
-                    if (initAudioOutput()) {
-                        lastAudioEnabled = true;
-                        audioReinitCounter = 0;
-                        audioInitAttempted = false;
-                    } else {
-                        audioReinitCounter++;
-                        qWarning() << "Failed to init audio output, attempt" << audioReinitCounter;
-                        // 如果初始化失败，暂时禁用音频
-                        m_audioEnabled.storeRelaxed(false);
-                        lastAudioEnabled = false;
-                    }
-                } else {
-                    qWarning() << "Audio init failed too many times, disabling permanently";
-                    m_audioEnabled.storeRelaxed(false);
-                    lastAudioEnabled = false;
-                }
-            } else if (!currentAudioEnabled && m_audioOutput) {
-                qDebug() << "Main loop: Disabling audio output";
-                {
-                    QMutexLocker locker(&m_audioMutex);
-                    if (m_audioOutput) {           // 双重检查
-                        m_audioOutput->stop();
-                        delete m_audioOutput;
-                        m_audioOutput = nullptr;
-                        m_audioDevice = nullptr;
-                    }
-                }
-                lastAudioEnabled = false;
+        // 主循环只负责：sink 还不存在、但音频需要启用时，创建它
+        // suspend/resume 全部由 enableAudio/disableAudio 在 UI 线程立即执行
+        if (m_audioEnabled.loadRelaxed() && !m_audioOutput && audioDecoderReady) {
+            qDebug() << "Main loop: Initializing audio output (attempt" << audioReinitCounter + 1 << ")";
+            if (initAudioOutput()) {
                 audioReinitCounter = 0;
+            } else {
+                audioReinitCounter++;
+                if (audioReinitCounter >= 3) {
+                    qWarning() << "Audio init failed 3 times, disabling";
+                    m_audioEnabled.storeRelaxed(false);
+                }
             }
         }
 
@@ -614,23 +627,10 @@ void DecoderThread::run()
 
         // 暂停/恢复处理
         if (m_pause) {
-            {
-                QMutexLocker locker(&m_audioMutex);
-                if (m_audioOutput && m_audioOutput->state() != QAudio::SuspendedState) {
-                    m_audioOutput->suspend();
-                }
-            }
             QThread::msleep(10);
             continue;
-        } else {
-            {
-                QMutexLocker locker(&m_audioMutex);
-                if (m_audioOutput && m_audioOutput->state() == QAudio::SuspendedState) {
-                    m_audioOutput->resume();
-                    qDebug() << "Audio resumed from suspended state";
-                }
-            }
         }
+        // ★ 不再有 else 分支操作 sink
 
         int ret = av_read_frame(fmtCtx, packet);
         if (ret < 0) {
@@ -736,7 +736,6 @@ void DecoderThread::run()
         // ========== 处理音频包（优化版本）==========
         // ========== 处理音频包 ==========
         else if (packet->stream_index == audioIdx && m_audioCodecCtx) {
-            // 只在锁内取一次设备指针，之后 write 放锁外
             QIODevice *dev = nullptr;
             {
                 QMutexLocker locker(&m_audioMutex);
@@ -765,9 +764,9 @@ void DecoderThread::run()
                     m_audioClock += (double)audioFrame->nb_samples / m_actualAudioSampleRate;
                 }
 
-                // seek 后丢弃还没追上目标位置的旧帧
+                // flush：seek 后只丢明显落后的帧，有帧立即关闭
                 if (m_audioFlush.load()) {
-                    if (m_audioClock < m_currentTime - 0.05) {
+                    if (m_audioClock < m_currentTime - 1.0) {
                         av_frame_unref(audioFrame);
                         continue;
                     }
@@ -795,19 +794,21 @@ void DecoderThread::run()
                     if (samplesConverted > 0) {
                         int dataSize = samplesConverted * 2 * sizeof(int16_t);
 
-                        // 每次写入前重新取一次设备指针，并确认它和之前是同一个
                         QIODevice *cur = nullptr;
+                        bool shouldWrite = false;
                         {
                             QMutexLocker locker(&m_audioMutex);
                             if (m_audioOutput && m_audioDevice == dev) {
                                 cur = dev;
+                                QAudio::State s = m_audioOutput->state();
+                                // ★ IdleState 等数据，ActiveState 正在播，两者都要写
+                                shouldWrite = (s == QAudio::IdleState || s == QAudio::ActiveState);
                             }
                         }
-                        if (cur) {
+                        if (cur && shouldWrite) {
                             cur->write(m_audioBuffer.constData(), dataSize);
                             m_lastAudioWriteTime = QDateTime::currentMSecsSinceEpoch();
                         }
-                        // 如果 cur 为 nullptr，说明设备已经被换掉/销毁了，跳过这次写
                     }
                 }
 
